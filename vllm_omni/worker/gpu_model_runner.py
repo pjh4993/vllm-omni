@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._omni_per_req_additional_information: dict[str, dict] | None = None
+        self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
 
@@ -234,6 +234,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -312,14 +313,52 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
             self.requests[req_id] = req_state
 
-            # Decode and store omni-specific payloads on CPU.
-            pe_cpu = self._resolve_prompt_embeds_cpu(new_req_data.prompt_embeds)
-            if pe_cpu is not None:
-                setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
+            # If prompt embeddings are provided, decode and attach to inter_data
+            try:
+                if getattr(new_req_data, "prompt_embeds", None) is not None:
+                    payload = new_req_data.prompt_embeds
+                    dtype = getattr(np, payload.dtype)
+                    arr = np.frombuffer(payload.data, dtype=dtype)
+                    arr = arr.reshape(payload.shape)
+                    pe_cpu = torch.from_numpy(arr)
+                    setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
+                    try:
+                        new_req_data.prompt_embeds = pe_cpu  # type: ignore[assignment]
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"Error decoding prompt embeds: {e}")
+            # Decode additional_information payloads (dictionary)
+            try:
+                if getattr(new_req_data, "additional_information", None) is not None:
+                    logger.warning_once(
+                        "additional_information on request data is deprecated, use model_intermediate_buffer"
+                    )
+                    payload_info = new_req_data.additional_information
+                    info_dict = {}
+                    if isinstance(payload_info, dict):
+                        info_dict = payload_info
+                    else:
+                        from vllm_omni.engine import AdditionalInformationPayload
 
-            info_dict = self._resolve_additional_information(getattr(new_req_data, "additional_information", None))
-            if info_dict:
-                setattr(self.requests[req_id], "additional_information_cpu", info_dict)
+                        if isinstance(payload_info, AdditionalInformationPayload):
+                            for k, entry in payload_info.entries.items():
+                                if entry.tensor_data is not None:
+                                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
+                                    arr = np.frombuffer(entry.tensor_data, dtype=dt)
+                                    arr = arr.reshape(entry.tensor_shape)
+                                    info_dict[k] = torch.from_numpy(arr.copy())
+                                else:
+                                    info_dict[k] = entry.list_data
+                    if info_dict:
+                        self.model_intermediate_buffer[req_id] = info_dict
+                        setattr(
+                            self.requests[req_id],
+                            "additional_information_cpu",
+                            info_dict,
+                        )
+            except Exception as e:
+                logger.error(f"Error decoding additional information: {e}")
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -884,6 +923,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         newly scheduled requests and store them on CPU in the request state.
         """
         new_reqs = getattr(scheduler_output, "scheduled_new_reqs", [])
+        if not new_reqs:
+            return
         for nr in new_reqs:
             req_id = getattr(nr, "req_id", None) or getattr(nr, "request_id", None)
             if req_id is None or req_id not in self.requests:
@@ -891,17 +932,22 @@ class OmniGPUModelRunner(GPUModelRunner):
             pe_cpu = self._resolve_prompt_embeds_cpu(getattr(nr, "prompt_embeds", None))
             if pe_cpu is not None:
                 setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
-            info_dict = self._resolve_additional_information(getattr(nr, "additional_information", None))
+            info_payload = getattr(nr, "additional_information", None)
+            if info_payload is not None:
+                logger.warning_once(
+                    "additional_information on request data is deprecated, use model_intermediate_buffer"
+                )
+            info_dict = self._resolve_additional_information(info_payload)
             if info_dict:
+                self.model_intermediate_buffer[req_id] = info_dict
                 setattr(self.requests[req_id], "additional_information_cpu", info_dict)
 
     def _gather_runtime_additional_information(self) -> list[dict]:
-        """Gather per-request additional_information stored in request state in batch order."""
+        """Gather per-request model_intermediate_buffer in batch order."""
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
-            req_state = self.requests.get(req_id)
-            info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-            if info and isinstance(info, dict):
+            info = self.model_intermediate_buffer.get(req_id, {})
+            if info:
                 per_req_runtime_info.append(info)
                 if "thinker_reply_part_per_request" in info:
                     q = info["thinker_reply_part_per_request"]
@@ -921,12 +967,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         return req_token_spans
 
     def _build_model_kwargs_extra(self) -> dict:
-        """Build extra keyword arguments passed to the model for this step, including:
-        - runtime_additional_information: per-request additional information stored in request state
-        """
+        """Build extra keyword arguments passed to the model for this step."""
         model_kwargs_extra: dict[str, object] = {}
         try:
-            model_kwargs_extra["runtime_additional_information"] = self._gather_runtime_additional_information()
+            buffer_map = self._gather_runtime_additional_information()
+            model_kwargs_extra["model_intermediate_buffer"] = buffer_map
+            # Backward compatible: also emit old name
+            model_kwargs_extra["runtime_additional_information"] = buffer_map
         except Exception as e:
             logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
             import traceback
@@ -941,23 +988,20 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        """Process model-provided per-request additional_information updates and merge into request state."""
+        """Process model-provided per-request updates and merge into model_intermediate_buffer."""
         try:
             # execute the custom postprocess function
             # TODO(Peiqi): do we have a more elegant way to do this?
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
-                    req_state = self.requests.get(req_id)
-                    req_infos = (
-                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-                    )
+                    req_infos = self.model_intermediate_buffer.get(req_id, {})
                     start_offset = int(self.query_start_loc.cpu[req_index])
                     sched_tokens = int(num_scheduled_tokens_np[req_index])
                     s, e = start_offset, start_offset + sched_tokens
                     # only consider to store data into update dict.
                     hidden_states_slice = hidden_states[s:e]
                     update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
-                    self._merge_additional_information_update(req_id, update_dict)
+                    self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
             logger.error(
                 f"Error merging for requests:{self.input_batch.req_ids} "
@@ -991,27 +1035,23 @@ class OmniGPUModelRunner(GPUModelRunner):
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
 
-    def _update_request_information(self, request_id: str, payload_info: dict) -> None:
-        """Update per-request additional_information stored in request state."""
-        req_state = self.requests.get(request_id)
-        if req_state is None:
-            return
-
-        info_dict = getattr(req_state, "additional_information_cpu", None)
-        if isinstance(payload_info, dict) and info_dict is not None:
-            info_dict.update(payload_info)
-
     def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
             payload_info = getattr(new_req, "additional_information", None)
             if isinstance(payload_info, dict):
-                self._update_request_information(new_req.req_id, payload_info)
+                logger.warning_once(
+                    "additional_information on request data is deprecated, use model_intermediate_buffer"
+                )
+                self._update_intermediate_buffer(new_req.req_id, payload_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
+            logger.warning_once(
+                "additional_information on scheduled_cached_reqs is deprecated, use model_intermediate_buffer"
+            )
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
             if isinstance(cached_infos, dict):
                 for req_id, req_infos in cached_infos.items():
-                    self._update_request_information(req_id, req_infos)
+                    self._update_intermediate_buffer(req_id, req_infos)
 
     def _maybe_attach_mimo_audio_req_infos(
         self,
@@ -1158,10 +1198,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             if self.vllm_config.model_config.async_chunk:
                 self._update_additional_information(scheduler_output)
             for req_index, req_id in enumerate(self.input_batch.req_ids):
-                req_state = self.requests.get(req_id)
-                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+                req_infos = self.model_intermediate_buffer.get(req_id, {})
 
                 # mimo-audio check
+                req_state = self.requests.get(req_id)
                 req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
@@ -1270,23 +1310,25 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_last_model_output = model_output
         return model_output
 
-    def _merge_additional_information_update(self, req_id: str, upd: dict | None) -> None:
-        if not isinstance(upd, dict):
+    def _update_intermediate_buffer(self, req_id: str, upd: dict) -> None:
+        if not isinstance(upd, dict) or not upd:
             return
         req_state = self.requests.get(req_id)
         if req_state is None:
             return
-        existing = getattr(req_state, "additional_information_cpu", {})
-        if not isinstance(existing, dict):
-            existing = {}
-        merged = dict(existing)
+        existing = self.model_intermediate_buffer.setdefault(req_id, {})
         for k, v in upd.items():
             if isinstance(v, torch.Tensor):
-                merged[k] = v.detach().to("cpu").contiguous()
+                existing[k] = v.detach().to("cpu").contiguous()
             elif isinstance(v, list):
-                merged[k] = [
+                existing[k] = [
                     (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in v
                 ]
             else:
-                merged[k] = v
-        setattr(req_state, "additional_information_cpu", merged)
+                existing[k] = v
+        # Backward compatible: mirror to old setattr location
+        setattr(req_state, "additional_information_cpu", existing)
+
+    def _merge_additional_information_update(self, req_id, upd):
+        logger.warning_once("_merge_additional_information_update is deprecated, use _update_intermediate_buffer")
+        return self._update_intermediate_buffer(req_id, upd)
