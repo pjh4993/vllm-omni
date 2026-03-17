@@ -13,11 +13,16 @@ RUN apt-get update && \
 
 RUN uv pip uninstall --system -y vllm || true
 
-# Install vLLM from source at the selected commit using precompiled artifacts
+# Install vLLM from precompiled wheel at the selected commit.
+# Must use direct URL because the wheel has a PEP 440 local version identifier
+# (e.g. +g0a0a1a198) which pip/uv refuse to install from a PEP 503 package index.
 ENV VLLM_PRECOMPILED_WHEEL_COMMIT=0a0a1a198be88e1782b52fa31738896468200a76
-RUN uv pip install --system --force-reinstall --prerelease=allow vllm \
-    --index-url https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT} \
-    --extra-index-url https://pypi.org/simple/
+RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
+    html=urllib.request.urlopen('https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm/').read().decode(); \
+    m=re.search(r'>(\S+x86_64\.whl)<',html); \
+    print('https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/'+m.group(1).replace('+','%2B'))") && \
+    echo "Installing vLLM from: ${VLLM_WHEEL_URL}" && \
+    uv pip install --system --force-reinstall "${VLLM_WHEEL_URL}"
 
 RUN uv pip install --system ".[dev]"
 
