@@ -100,6 +100,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
         talker_config.text_config.rope_parameters = talker_config.text_config.rope_scaling
+        talker_config.text_config.rope_parameters["rope_theta"] = talker_config.text_config.rope_theta
         self.quant_config = vllm_config.quant_config
         self.prefix = prefix
         self.vllm_config = vllm_config
