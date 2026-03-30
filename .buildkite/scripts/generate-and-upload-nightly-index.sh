@@ -29,7 +29,7 @@ echo "Python version: $($PYTHON --version)"
 
 # list all wheels in the commit directory
 echo "Existing wheels on S3:"
-aws s3 ls "$S3_COMMIT_PREFIX"
+aws s3 ls "$S3_COMMIT_PREFIX" || echo "(no objects found)"
 obj_json="objects.json"
 aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$SUBPATH/" --delimiter / --output json > "$obj_json"
 mkdir -p "$INDICES_OUTPUT_DIR"
