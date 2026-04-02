@@ -359,9 +359,9 @@ class AsyncOmniEngine:
                     else:
                         current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
-            logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
-            launch_cm.__exit__(None, None, None)
-            logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
+                logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
+                launch_cm.__exit__(None, None, None)
+                logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
             assert started_stage is not None
             return started_stage
         except Exception:
