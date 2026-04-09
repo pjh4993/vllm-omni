@@ -12,7 +12,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.cuda, pytest.mark.L4]
 
 npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="NPU platform not available.")
 
