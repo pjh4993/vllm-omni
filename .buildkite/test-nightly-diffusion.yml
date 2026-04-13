@@ -408,6 +408,7 @@ steps:
         if: *nightly_or_pr_label
         commands:
           - pip install lpips
+          - export VLLM_TEST_CLEAN_GPU_MEMORY=1
           - pytest -s -v tests/quantization/test_quantization_quality.py -k "qwen_image" -m "advanced_model" --run-level "advanced_model"
         agents:
           queue: "mithril-h100-pool"
