@@ -373,14 +373,20 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
+            model,
+            subfolder="text_encoder",
+            local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
         ).to(placement_device)
         self.tokenizer = PixtralProcessor.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKLFlux2.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            placement_device
-        )
+        self.vae = AutoencoderKLFlux2.from_pretrained(
+            model,
+            subfolder="vae",
+            local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
+        ).to(placement_device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
         self.transformer = Flux2Transformer2DModel(**transformer_kwargs)
 
